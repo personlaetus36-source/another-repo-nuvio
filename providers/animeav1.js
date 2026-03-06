@@ -511,7 +511,13 @@ function getEpisodeUrlFromDetail(detailHtml, kind, episodeNum) {
 // ---------------------------------------------------------------------------
 
 function extractEmbedsFromEpisodePage(html) {
-  const scripts = Array.from(html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/gi)).map(function (m) { return m[1] || ''; });
+  // Use while/exec instead of matchAll — Hermes-safe (no Array.from / matchAll needed)
+  const scripts = [];
+  const scriptTagRe = /<script[^>]*>([\s\S]*?)<\/script>/gi;
+  let _sm;
+  while ((_sm = scriptTagRe.exec(html)) !== null) {
+    scripts.push(_sm[1] || '');
+  }
   const script = scripts.find(function (s) { return s.indexOf('__sveltekit_') !== -1; }) || '';
   if (!script) return [];
   const out = [];
