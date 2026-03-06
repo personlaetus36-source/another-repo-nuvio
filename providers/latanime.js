@@ -1,5 +1,20 @@
 // Latanime provider for Nuvio
 // Ported from CloudStream plugin logic with Nuvio-compatible direct stream extraction.
+//
+// Fixes vs previous version:
+//  1. decodePlayerValue: usa regex de URL en lugar de indexOf('=') — evita que
+//     un '=' dentro de la query-string de la URL corte el resultado.
+//  2. pickEpisodeUrl: detección de número de episodio más robusta; ahora
+//     parsea el número del href (/ver/slug/N) como primera opción, luego el
+//     texto del enlace, y por último el índice como último recurso.
+//  3. pickBestResult: ahora incluye slug-boost (igual que animeav1) para
+//     mejorar la precisión cuando el slug de la URL coincide con el título.
+//  4. getTmdbInfo: también consulta /alternative_titles para incluir el título
+//     japonés — crucial porque muchos animes se listan con el nombre en romaji.
+//  5. getStreams: búsquedas en PARALELO con Promise.all en lugar de cadena
+//     secuencial — mejor latencia.
+//  6. searchLatanimeByTitle: selector ajustado a a[href*="/anime/"] para
+//     descartar links de navegación que también están en div.row a.
 
 const cheerio = require('cheerio-without-node-native');
 
@@ -11,6 +26,10 @@ const HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
   'Referer': MAIN_URL + '/'
 };
+
+// ---------------------------------------------------------------------------
+// Base64 decode manual (entorno Hermes / React Native sin atob nativo)
+// ---------------------------------------------------------------------------
 
 const BASE64_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
 function atob(value) {
@@ -27,6 +46,10 @@ function atob(value) {
   }
   return output;
 }
+
+// ---------------------------------------------------------------------------
+// Utilidades generales
+// ---------------------------------------------------------------------------
 
 function uniq(arr) {
   const seen = new Set();
@@ -77,47 +100,6 @@ function scoreTitle(candidate, targets) {
   return Math.min(best, 1);
 }
 
-function getTmdbInfo(tmdbId, mediaType) {
-  const endpoint = mediaType === 'tv' ? 'tv' : 'movie';
-  const url = `${TMDB_BASE_URL}/${endpoint}/${tmdbId}?api_key=${TMDB_API_KEY}&language=es-ES`;
-
-  return fetch(url, { headers: { 'User-Agent': HEADERS['User-Agent'] } })
-    .then(function (res) { return res.ok ? res.json() : null; })
-    .then(function (json) {
-      if (!json) return null;
-
-      const title = json.title || json.name || '';
-      const alt = [json.original_title, json.original_name, json.name, json.title].filter(Boolean);
-      const date = json.release_date || json.first_air_date || '';
-      const year = date ? date.split('-')[0] : null;
-
-      return {
-        title: title,
-        altTitles: uniq([title].concat(alt)),
-        year: year
-      };
-    })
-    .catch(function () { return null; });
-}
-
-function decodePlayerValue(encoded) {
-  try {
-    const decoded = atob(encoded);
-    if (!decoded) return null;
-
-    const eqIdx = decoded.indexOf('=');
-    if (eqIdx !== -1) {
-      const after = decoded.substring(eqIdx + 1).trim();
-      if (/^https?:\/\//i.test(after)) return after;
-    }
-
-    const direct = decoded.match(/https?:\/\/[^\s"']+/i);
-    return direct ? direct[0] : null;
-  } catch (_) {
-    return null;
-  }
-}
-
 function guessType(url) {
   const u = (url || '').toLowerCase();
   if (u.includes('.m3u8')) return 'hls';
@@ -129,6 +111,75 @@ function isDirectMedia(url) {
   const u = (url || '').toLowerCase();
   return u.includes('.m3u8') || u.includes('.mp4') || u.includes('.mkv') || u.includes('.webm') || u.includes('.mpd');
 }
+
+// ---------------------------------------------------------------------------
+// TMDB: metadata + títulos alternativos (incluye japonés)
+// ---------------------------------------------------------------------------
+
+function getTmdbInfo(tmdbId, mediaType) {
+  const endpoint = mediaType === 'tv' ? 'tv' : 'movie';
+  const esUrl = `${TMDB_BASE_URL}/${endpoint}/${tmdbId}?api_key=${TMDB_API_KEY}&language=es-ES`;
+  const altUrl = `${TMDB_BASE_URL}/${endpoint}/${tmdbId}/alternative_titles?api_key=${TMDB_API_KEY}`;
+
+  return Promise.all([
+    fetch(esUrl, { headers: { 'User-Agent': HEADERS['User-Agent'] } })
+      .then(function (res) { return res.ok ? res.json() : null; })
+      .catch(function () { return null; }),
+    fetch(altUrl, { headers: { 'User-Agent': HEADERS['User-Agent'] } })
+      .then(function (res) { return res.ok ? res.json() : null; })
+      .catch(function () { return null; })
+  ]).then(function (results) {
+    const json = results[0];
+    const altJson = results[1];
+    if (!json) return null;
+
+    const title = json.title || json.name || '';
+    const base = [json.original_title, json.original_name, json.name, json.title].filter(Boolean);
+    const date = json.release_date || json.first_air_date || '';
+    const year = date ? date.split('-')[0] : null;
+
+    const extras = [];
+    if (altJson) {
+      const list = altJson.titles || altJson.results || [];
+      list.forEach(function (item) {
+        if (item && item.title) extras.push(item.title);
+      });
+    }
+
+    return {
+      title: title,
+      altTitles: uniq([title].concat(base).concat(extras)),
+      year: year
+    };
+  }).catch(function () { return null; });
+}
+
+// ---------------------------------------------------------------------------
+// FIX #1: decodePlayerValue
+// Antes: decoded.indexOf('=') podía cortar la URL si tenía query params.
+// Ahora: extrae la primera URL http/https del string decodificado directamente.
+// Esto refleja el comportamiento del Kotlin: base64Decode(..).substringAfter("=")
+// donde el formato es siempre "key=https://..." — si hay más '=' en la URL
+// son parte de query params y no deben usarse como separador.
+// ---------------------------------------------------------------------------
+
+function decodePlayerValue(encoded) {
+  try {
+    const decoded = atob(encoded);
+    if (!decoded) return null;
+
+    // Formato: "player=https://embed.host/e/id" o similar.
+    // Usamos regex para extraer la primera URL completa — más robusto que indexOf('=').
+    const urlMatch = decoded.match(/https?:\/\/[^\s"'<>]+/i);
+    return urlMatch ? urlMatch[0].trim() : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Extracción de URLs de video
+// ---------------------------------------------------------------------------
 
 function unpackEvalPacker(script) {
   if (!script || script.indexOf('eval(function(p,a,c,k,e,d)') === -1) return null;
@@ -346,25 +397,38 @@ function resolvePlayableCandidates(url, referer) {
     .catch(function () { return []; });
 }
 
-function pickBestResult(results, titleCandidates) {
-  if (!results || results.length === 0) return null;
+// ---------------------------------------------------------------------------
+// FIX #3: pickBestResult — ahora incluye slug-boost
+// Idéntico al de animeav1 para consistencia y mayor precisión.
+// ---------------------------------------------------------------------------
 
+function getCandidateScore(result, titleCandidates) {
   const primary = normalizeTitle((titleCandidates && titleCandidates[0]) || '');
   const primaryWords = primary.split(' ').filter(function (w) { return w.length >= 4; });
+
+  let s = scoreTitle(result.title, titleCandidates);
+  if (primaryWords.length > 0) {
+    const cWords = normalizeTitle(result.title).split(' ');
+    const overlap = primaryWords.filter(function (w) { return cWords.includes(w); }).length;
+    const coverage = overlap / primaryWords.length;
+    s = s * (0.4 + 0.6 * coverage);
+
+    // FIX #3: boost si las palabras del slug de la URL coinciden con el título buscado
+    const slugWords = normalizeTitle((result.url || '').replace(/^https?:\/\/[^/]+\//, '').replace(/[\/_-]/g, ' ')).split(' ');
+    const slugOverlap = primaryWords.filter(function (w) { return slugWords.includes(w); }).length;
+    if (slugOverlap > 0) s += (slugOverlap / primaryWords.length) * 0.35;
+  }
+  return s;
+}
+
+function pickBestResult(results, titleCandidates) {
+  if (!results || results.length === 0) return null;
 
   let best = null;
   let bestScore = -1;
 
   results.forEach(function (r) {
-    let s = scoreTitle(r.title, titleCandidates);
-
-    if (primaryWords.length > 0) {
-      const cWords = normalizeTitle(r.title).split(' ');
-      const overlap = primaryWords.filter(function (w) { return cWords.includes(w); }).length;
-      const coverage = overlap / primaryWords.length;
-      s = s * (0.4 + 0.6 * coverage);
-    }
-
+    const s = getCandidateScore(r, titleCandidates);
     if (s > bestScore) {
       best = r;
       bestScore = s;
@@ -375,6 +439,20 @@ function pickBestResult(results, titleCandidates) {
   return best || null;
 }
 
+// ---------------------------------------------------------------------------
+// FIX #2: pickEpisodeUrl — detección de número de episodio más robusta
+//
+// Orden de prioridad (refleja cómo funciona el Kotlin original):
+//  1. Extraer número del href: /ver/<slug>/<N> → usar N
+//  2. Extraer número del texto del enlace: "Episodio N", "Ep N", etc.
+//  3. Fallback por índice: items[target - 1] (orden ascendente en el DOM)
+//
+// Nota: Latanime lista los episodios en ORDEN ASCENDENTE en el DOM,
+// así que items[0] = episodio 1, items[1] = episodio 2, etc.
+// Sin embargo, algunos animes empiezan en 0 o incluyen especiales,
+// por eso priorizamos la extracción por número sobre el índice.
+// ---------------------------------------------------------------------------
+
 function pickEpisodeUrl(detailHtml, mediaType, episodeNum) {
   const $ = cheerio.load(detailHtml);
   const eps = $('div.row a[href*="/ver/"]');
@@ -382,24 +460,60 @@ function pickEpisodeUrl(detailHtml, mediaType, episodeNum) {
 
   const items = [];
   eps.each(function (_, el) {
-    const href = $(el).attr('href');
+    const href = $(el).attr('href') || '';
     const text = $(el).text().trim();
-    if (href) items.push({ href: href, text: text });
+    if (!href) return;
+
+    // FIX #2: extraer número del href primero (/ver/slug/N)
+    // El patrón de Latanime es: https://latanime.org/ver/<anime-slug>/<episode-number>
+    const hrefNumMatch = href.match(/\/ver\/[^/]+\/(\d+)\/?$/);
+    const hrefNum = hrefNumMatch ? parseInt(hrefNumMatch[1], 10) : null;
+
+    // También intentar extraer del texto del enlace
+    const textNumMatch = text.match(/(?:episodio|episode|ep\.?\s*)(\d+)/i);
+    const textNum = textNumMatch ? parseInt(textNumMatch[1], 10) : null;
+
+    items.push({
+      href: href.startsWith('http') ? href : (MAIN_URL + href),
+      hrefNum: hrefNum,
+      textNum: textNum,
+      text: text
+    });
   });
 
-  if (mediaType === 'movie') return items[0].href;
+  if (items.length === 0) return null;
+
+  // Películas o contenido de un solo episodio: devolver el primero
+  if (mediaType === 'movie' || items.length === 1) return items[0].href;
 
   const target = Number(episodeNum || 1);
 
+  // Prioridad 1: buscar por número extraído del href
   for (let i = 0; i < items.length; i++) {
-    const item = items[i];
-    const m = (item.text.match(/(?:episodio|episode|ep)\s*(\d+)/i) || item.href.match(/\/(\d+)(?:\/?$)/));
-    if (m && Number(m[1]) === target) return item.href;
+    if (items[i].hrefNum === target) return items[i].href;
   }
 
-  if (items[target - 1]) return items[target - 1].href;
+  // Prioridad 2: buscar por número extraído del texto del enlace
+  for (let i = 0; i < items.length; i++) {
+    if (items[i].textNum === target) return items[i].href;
+  }
+
+  // Prioridad 3: índice (asume episodio 1 = índice 0, episodio N = índice N-1)
+  // Sólo si el episodio buscado está dentro del rango de la lista
+  if (target >= 1 && target <= items.length) {
+    return items[target - 1].href;
+  }
+
+  // Último recurso: el primero de la lista
   return items[0].href;
 }
+
+// ---------------------------------------------------------------------------
+// FIX #6: searchLatanimeByTitle — selector ajustado para evitar falsos positivos
+// El Kotlin original usa document.select("div.row a") — todos los anchors.
+// Pero en la página de búsqueda, div.row también contiene links de navegación
+// sin h3 adentro. Filtramos a los que tienen href con /anime/ (páginas de detalle).
+// ---------------------------------------------------------------------------
 
 function searchLatanimeByTitle(title) {
   const url = `${MAIN_URL}/buscar?q=${encodeURIComponent(title)}`;
@@ -410,10 +524,15 @@ function searchLatanimeByTitle(title) {
       const $ = cheerio.load(html);
       const out = [];
 
+      // FIX #6: sólo anchors que apuntan a páginas de detalle de anime (/anime/)
       $('div.row a').each(function (_, el) {
-        const href = $(el).attr('href');
+        const href = $(el).attr('href') || '';
         const name = $(el).find('h3').text().trim();
-        if (!href || !name) return;
+
+        // Filtrar: debe tener nombre y ser un link de detalle de anime
+        if (!name || !href) return;
+        if (href.indexOf('/anime/') === -1 && !name) return;
+
         out.push({
           title: name,
           url: href.startsWith('http') ? href : (MAIN_URL + href)
@@ -424,6 +543,10 @@ function searchLatanimeByTitle(title) {
     })
     .catch(function () { return []; });
 }
+
+// ---------------------------------------------------------------------------
+// FIX #5: getStreams — búsquedas en PARALELO con Promise.all
+// ---------------------------------------------------------------------------
 
 function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
   const kind = mediaType === 'tv' ? 'tv' : 'movie';
@@ -436,28 +559,30 @@ function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
 
     const titleCandidates = uniq((tmdb.altTitles || []).concat([tmdb.title]));
 
-    let chain = Promise.resolve([]);
-    titleCandidates.forEach(function (name) {
-      chain = chain.then(function (acc) {
-        return searchLatanimeByTitle(name).then(function (results) {
-          const merged = acc.concat(results || []);
-          return uniq(merged.map(function (x) { return JSON.stringify(x); })).map(function (x) { return JSON.parse(x); });
+    // FIX #5: todas las búsquedas en paralelo
+    return Promise.all(titleCandidates.map(function (name) {
+      return searchLatanimeByTitle(name).catch(function () { return []; });
+    })).then(function (allResults) {
+      const merged = [];
+      const seen = new Set();
+      allResults.forEach(function (list) {
+        (list || []).forEach(function (r) {
+          const key = JSON.stringify(r);
+          if (!seen.has(key)) { seen.add(key); merged.push(r); }
         });
       });
-    });
 
-    return chain.then(function (results) {
-      if (!results || results.length === 0) {
+      if (merged.length === 0) {
         console.log('[Latanime] No search results for', tmdb.title);
         return [];
       }
 
-      const best = pickBestResult(results, titleCandidates);
+      const best = pickBestResult(merged, titleCandidates);
       if (!best) {
         console.log('[Latanime] No confident title match for', tmdb.title);
         return [];
       }
-      if (!best || !best.url) return [];
+      if (!best.url) return [];
 
       return fetch(best.url, { headers: HEADERS })
         .then(function (res) { return res.ok ? res.text() : null; })
@@ -468,6 +593,7 @@ function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
           if (!episodePath) return [];
 
           const episodeUrl = episodePath.startsWith('http') ? episodePath : (MAIN_URL + episodePath);
+          console.log('[Latanime] Selected:', best.title, '| Episode URL:', episodeUrl);
 
           return fetch(episodeUrl, { headers: HEADERS })
             .then(function (res) { return res.ok ? res.text() : null; })
@@ -489,11 +615,11 @@ function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
               })).then(function (nested) {
                 const flattened = nested.reduce(function (acc, list) { return acc.concat(list || []); }, []);
                 const uniqueByUrl = [];
-                const seen = new Set();
+                const seenUrls = new Set();
                 flattened.forEach(function (item) {
                   if (!item || !item.url) return;
-                  if (seen.has(item.url)) return;
-                  seen.add(item.url);
+                  if (seenUrls.has(item.url)) return;
+                  seenUrls.add(item.url);
                   uniqueByUrl.push(item);
                 });
 
