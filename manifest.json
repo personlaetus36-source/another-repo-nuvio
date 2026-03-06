@@ -41,6 +41,54 @@
       ]
     },
     {
+      "id": "latanime",
+      "name": "Latanime",
+      "description": "Latanime anime streams (es-mx) with player link extraction",
+      "version": "1.0.0",
+      "author": "Nuvio Team",
+      "supportedTypes": [
+        "movie",
+        "tv"
+      ],
+      "filename": "providers/latanime.js",
+      "enabled": true,
+      "formats": [
+        "m3u8",
+        "mp4",
+        "mkv",
+        "mpd"
+      ],
+      "logo": "https://latanime.org/favicon.ico",
+      "contentLanguage": [
+        "es",
+        "mx"
+      ]
+    },
+    {
+      "id": "animeav1",
+      "name": "AnimeAv1",
+      "description": "AnimeAv1 anime streams (es-mx) with SUB/DUB server extraction",
+      "version": "1.0.0",
+      "author": "Nuvio Team",
+      "supportedTypes": [
+        "movie",
+        "tv"
+      ],
+      "filename": "providers/animeav1.js",
+      "enabled": true,
+      "formats": [
+        "m3u8",
+        "mp4",
+        "mkv",
+        "mpd"
+      ],
+      "logo": "https://animeav1.com/favicon.png",
+      "contentLanguage": [
+        "es",
+        "mx"
+      ]
+    },
+    {
       "id": "uhdmovies",
       "name": "UHDMovies",
       "description": "UHD Movies streaming with multiple resolution",
